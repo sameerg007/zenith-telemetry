@@ -96,7 +96,7 @@ export default function BenchmarkPage() {
         setLoading(false);
       }
     };
-    fetchData();
+    fetchData()
   }, [instrumentCount]);
 
   return (
@@ -113,7 +113,7 @@ export default function BenchmarkPage() {
           min={1}
           max={50}
           value={instrumentCount}
-          onChange={e => setInstrumentCount(Math.max(1, Math.min(50, Number(e.target.value))))}
+          onChange={e => setInstrumentCount(Math.max(0, Math.min(50, Number(e.target.value))))}
           className="border px-2 py-1 rounded w-20"
         />
         {goCycleTime && (
