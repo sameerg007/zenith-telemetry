@@ -33,8 +33,8 @@ func handleConnection(conn net.Conn) {
 		case "*IDN?":
 			fmt.Fprintln(conn, "ZENITH-MOCK-B2901A-V2.6")
 		case ":MEAS?":
-			v := 0.8 + rand.Float64()*(1.2-0.8)
-			i := 0.01 + rand.Float64()*(0.05-0.01)
+			v := 0.8 + rand.Float64()*(2.1-0.2)
+			i := 0.01 + rand.Float64()*(0.59-0.01)
 			fmt.Fprintf(conn, "V:%.4f,I:%.4f\n", v, i)
 		default:
 			fmt.Fprintln(conn, "ERR:INVALID_SCPI_CMD")
