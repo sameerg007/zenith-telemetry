@@ -23,6 +23,7 @@ const (
 	defaultServerPort  = "8080"
 	requestTimeout     = 10 * time.Second
 	startupDelay       = 150 * time.Millisecond
+	maxConcurrentPolls = 100 // Worker pool size
 )
 
 type BenchmarkResponse struct {
@@ -84,36 +85,44 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 	var wg sync.WaitGroup
 	cycleStart := time.Now()
 
+	// Worker pool: buffered channel to limit concurrent goroutines.
+	semaphore := make(chan struct{}, maxConcurrentPolls)
+	results := make([]BenchmarkResponse, count)
+
 	for i := 0; i < count; i++ {
 		wg.Add(1)
-		id := fmt.Sprintf("SMU-%d", i+1)
-		addr := fmt.Sprintf("localhost:%d", instrumentPortBase+i)
-		go zEngine.Poll(ctx, id, addr, &wg)
+		semaphore <- struct{}{} // Acquire a slot
+
+		go func(i int) {
+			defer func() {
+				<-semaphore // Release the slot
+				wg.Done()
+			}()
+
+			id := fmt.Sprintf("SMU-%d", i+1)
+			addr := fmt.Sprintf("localhost:%d", instrumentPortBase+i)
+
+			res, err := zEngine.Poll(ctx, id, addr)
+			if err != nil {
+				slog.Warn("poll error", "device", id, "error", err)
+			}
+
+			// No mutex needed: each goroutine writes to its own unique index.
+			results[i] = BenchmarkResponse{
+				Device:    res.DeviceID,
+				GoLatency: fmt.Sprintf("%.3f", float64(res.Latency.Microseconds())/1000.0),
+				GoData:    strings.TrimSpace(res.Data),
+			}
+		}(i)
 	}
 
-	go func() {
-		wg.Wait()
-		close(zEngine.Results)
-	}()
-
-	var measurements []BenchmarkResponse
-	for res := range zEngine.Results {
-		if res.Err != nil {
-			slog.Warn("poll error", "device", res.DeviceID, "error", res.Err)
-		}
-		measurements = append(measurements, BenchmarkResponse{
-			Device:    res.DeviceID,
-			GoLatency: fmt.Sprintf("%.3f", float64(res.Latency.Microseconds())/1000.0),
-			GoData:    strings.TrimSpace(res.Data),
-		})
-	}
-
+	wg.Wait()
 	cycleMs := float64(time.Since(cycleStart).Microseconds()) / 1000.0
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(BenchmarkResult{
 		CycleTimeMs:  fmt.Sprintf("%.3f", cycleMs),
-		Measurements: measurements,
+		Measurements: results,
 	}); err != nil {
 		slog.Error("failed to encode benchmark response", "error", err)
 	}
