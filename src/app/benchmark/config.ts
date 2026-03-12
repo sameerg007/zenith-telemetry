@@ -1,6 +1,8 @@
-// Example benchmark configuration
-export const benchmarkResults = [
-  { name: 'Test 1', value: 123, unit: 'ms' },
-  { name: 'Test 2', value: 456, unit: 'ms' },
-  { name: 'Test 3', value: 789, unit: 'ms' }
-];
+/** Shared UI constants for the Zenith benchmark page. */
+export const BENCHMARK_CONFIG = {
+  defaultInstrumentCount: 5,
+  minInstruments: 1,
+  maxInstruments: 50,
+  /** Milliseconds to wait after the last input change before firing a fetch. */
+  debounceMs: 400,
+} as const;

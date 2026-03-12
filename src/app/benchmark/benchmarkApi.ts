@@ -15,18 +15,34 @@ export interface PyMeasurement {
   pyData: string;
 }
 
-export async function fetchGoBenchmarks(instrumentCount: number): Promise<BenchmarkResult<GoMeasurement>> {
-  const response = await fetch(`http://127.0.0.1:8080/benchmark?count=${instrumentCount}`);
+const GO_API_URL = process.env.NEXT_PUBLIC_GO_API_URL ?? 'http://127.0.0.1:8080';
+const PY_API_URL = process.env.NEXT_PUBLIC_PY_API_URL ?? 'http://127.0.0.1:8000';
+
+async function apiFetch<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(url, { signal });
   if (!response.ok) {
-    throw new Error('Failed to fetch Go benchmarks');
+    throw new Error(`Request to ${new URL(url).host} failed with status ${response.status}`);
   }
-  return response.json();
+  return response.json() as Promise<T>;
 }
 
-export async function fetchPythonBenchmarks(instrumentCount: number): Promise<BenchmarkResult<PyMeasurement>> {
-  const response = await fetch(`http://127.0.0.1:8000/benchmark?count=${instrumentCount}`);
-  if (!response.ok) {
-    throw new Error('Failed to fetch Python benchmarks');
-  }
-  return response.json();
+export function fetchGoBenchmarks(
+  instrumentCount: number,
+  signal?: AbortSignal,
+): Promise<BenchmarkResult<GoMeasurement>> {
+  return apiFetch<BenchmarkResult<GoMeasurement>>(
+    `${GO_API_URL}/benchmark?count=${instrumentCount}`,
+    signal,
+  );
 }
+
+export function fetchPythonBenchmarks(
+  instrumentCount: number,
+  signal?: AbortSignal,
+): Promise<BenchmarkResult<PyMeasurement>> {
+  return apiFetch<BenchmarkResult<PyMeasurement>>(
+    `${PY_API_URL}/benchmark?count=${instrumentCount}`,
+    signal,
+  );
+}
+

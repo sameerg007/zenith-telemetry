@@ -1,21 +1,33 @@
 "use client";
 import React, { useState } from "react";
 
-export default function EquipmentConfig({ onChange }) {
-  const [numEquipments, setNumEquipments] = useState(1);
+interface EquipmentConfigProps {
+  onChange: (count: number) => void;
+  min?: number;
+  max?: number;
+}
 
-  const handleChange = (e) => {
+export default function EquipmentConfig({ onChange, min = 1, max = 50 }: EquipmentConfigProps) {
+  const [numEquipments, setNumEquipments] = useState(min);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const value = parseInt(e.target.value, 10);
-    setNumEquipments(value);
-    onChange(value);
+    if (!isNaN(value) && value >= min && value <= max) {
+      setNumEquipments(value);
+      onChange(value);
+    }
   };
 
   return (
     <div className="mb-8">
-      <label className="font-medium mr-2">Number of Equipments:</label>
+      <label htmlFor="num-equipments" className="font-medium mr-2">
+        Number of Equipments:
+      </label>
       <input
+        id="num-equipments"
         type="number"
-        min={1}
+        min={min}
+        max={max}
         value={numEquipments}
         onChange={handleChange}
         className="border px-2 py-1 rounded w-24"

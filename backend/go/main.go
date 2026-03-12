@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"zenith-telemetry/pkg/engine"
 	"zenith-telemetry/pkg/simulator"
@@ -16,7 +20,9 @@ import (
 const (
 	maxInstruments     = 50
 	instrumentPortBase = 9001
-	serverPort         = "8080"
+	defaultServerPort  = "8080"
+	requestTimeout     = 10 * time.Second
+	startupDelay       = 150 * time.Millisecond
 )
 
 type BenchmarkResponse struct {
@@ -30,19 +36,35 @@ type BenchmarkResult struct {
 	Measurements []BenchmarkResponse `json:"measurements"`
 }
 
-func enableCors(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+// allowedOrigin returns the CORS origin from the environment, defaulting to localhost.
+func allowedOrigin() string {
+	if o := os.Getenv("ALLOWED_ORIGIN"); o != "" {
+		return o
+	}
+	return "http://localhost:3000"
+}
+
+// corsMiddleware restricts cross-origin access to a configurable origin.
+func corsMiddleware(origin string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, `{"status":"ok"}`)
 }
 
 func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
-	enableCors(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
 	count, err := strconv.Atoi(r.URL.Query().Get("count"))
 	if err != nil || count < 1 {
 		count = 5
@@ -55,7 +77,8 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 		Results: make(chan engine.Measurement, count),
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Honour both the global request timeout and any client-side cancellation.
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -75,6 +98,9 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 
 	var measurements []BenchmarkResponse
 	for res := range zEngine.Results {
+		if res.Err != nil {
+			slog.Warn("poll error", "device", res.DeviceID, "error", res.Err)
+		}
 		measurements = append(measurements, BenchmarkResponse{
 			Device:    res.DeviceID,
 			GoLatency: fmt.Sprintf("%.3f", float64(res.Latency.Microseconds())/1000.0),
@@ -85,26 +111,67 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 	cycleMs := float64(time.Since(cycleStart).Microseconds()) / 1000.0
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(BenchmarkResult{
+	if err := json.NewEncoder(w).Encode(BenchmarkResult{
 		CycleTimeMs:  fmt.Sprintf("%.3f", cycleMs),
 		Measurements: measurements,
-	})
+	}); err != nil {
+		slog.Error("failed to encode benchmark response", "error", err)
+	}
+}
+
+func serverPort() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return p
+	}
+	return defaultServerPort
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	for i := 0; i < maxInstruments; i++ {
-		port := strconv.Itoa(instrumentPortBase + i)
-		go simulator.StartMockInstrument(port)
+		go simulator.StartMockInstrument(strconv.Itoa(instrumentPortBase + i))
 	}
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(startupDelay)
 
-	fmt.Println("--- ZENITH GO PARALLEL ENGINE ---")
-	fmt.Printf("Mock Instruments : %d active (ports %d-%d)\n",
-		maxInstruments, instrumentPortBase, instrumentPortBase+maxInstruments-1)
-	fmt.Printf("HTTP Server      : http://localhost:%s/benchmark?count=N\n", serverPort)
+	origin := allowedOrigin()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/benchmark", benchmarkHandler)
 
-	http.HandleFunc("/benchmark", benchmarkHandler)
-	if err := http.ListenAndServe(":"+serverPort, nil); err != nil {
-		fmt.Println("Server error:", err)
+	port := serverPort()
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      corsMiddleware(origin, mux),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
+
+	slog.Info("ZENITH GO PARALLEL ENGINE",
+		"instruments", maxInstruments,
+		"port_range", fmt.Sprintf("%d-%d", instrumentPortBase, instrumentPortBase+maxInstruments-1),
+		"listen", fmt.Sprintf("http://localhost:%s", port),
+		"allowed_origin", origin,
+	)
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server error", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	slog.Info("shutting down server…")
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		slog.Error("graceful shutdown failed", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("server stopped")
 }

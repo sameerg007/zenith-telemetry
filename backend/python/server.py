@@ -1,42 +1,69 @@
 """
 Zenith Python Parallel Engine
-Flask HTTP server that polls real mock TCP instruments in parallel threads.
-Mock instruments are pre-started at server boot on ports 9101-9150.
+Flask HTTP server that polls mock TCP instruments via a ThreadPoolExecutor.
+Mock instruments are started at server boot on ports 9101–9150.
+
+Production usage:
+    gunicorn --workers 1 --threads 64 --bind 0.0.0.0:8000 server:app
 """
+from __future__ import annotations
+
+import logging
+import os
 import socket
 import threading
 import time
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration (environment-variable driven)
+# ---------------------------------------------------------------------------
+INSTRUMENT_PORT_BASE: int = 9101          # Python mock instruments: 9101–9150
+MAX_INSTRUMENTS: int = 50
+ALLOWED_ORIGIN: str = os.environ.get("ALLOWED_ORIGIN", "http://localhost:3000")
+PORT: int = int(os.environ.get("PORT", "8000"))
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
-CORS(app)
-
-INSTRUMENT_PORT_BASE = 9101   # Python mock instruments: 9101–9150
-MAX_INSTRUMENTS = 50
-
-_instruments_started = False
-_instruments_lock = threading.Lock()
-
+CORS(app, origins=[ALLOWED_ORIGIN])
 
 # ---------------------------------------------------------------------------
 # Mock TCP instrument
 # ---------------------------------------------------------------------------
+_instruments_started = False
+_instruments_lock = threading.Lock()
+
 
 def _handle_instrument_connection(conn: socket.socket) -> None:
     with conn:
         while True:
-            data = conn.recv(1024)
+            try:
+                data = conn.recv(1024)
+            except OSError:
+                break
             if not data:
                 break
-            command = data.decode().strip()
+            command = data.decode(errors="replace").strip()
             if command == "*IDN?":
                 conn.sendall(b"ZENITH-MOCK-B2901A-V2.6\n")
             elif command == ":MEAS?":
-                v = 0.8 + random.random() * (1.2 - 0.8)       # 0.8 V – 1.2 V
-                i = 0.01 + random.random() * (0.05 - 0.01)     # 10 mA – 50 mA
+                v = 0.8 + random.random() * (1.2 - 0.8)
+                i = 0.01 + random.random() * (0.05 - 0.01)
                 conn.sendall(f"V:{v:.4f},I:{i:.4f}\n".encode())
             else:
                 conn.sendall(b"ERR:INVALID_SCPI_CMD\n")
@@ -45,16 +72,24 @@ def _handle_instrument_connection(conn: socket.socket) -> None:
 def _run_mock_instrument(port: int) -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("localhost", port))
+    try:
+        s.bind(("localhost", port))
+    except OSError as exc:
+        logger.error("Failed to bind mock instrument on port %d: %s", port, exc)
+        return
     s.listen()
     while True:
-        conn, _ = s.accept()
+        try:
+            conn, _ = s.accept()
+        except OSError:
+            break
         threading.Thread(
             target=_handle_instrument_connection, args=(conn,), daemon=True
         ).start()
 
 
-def _ensure_instruments_started() -> None:
+def ensure_instruments_started() -> None:
+    """Start all mock instrument servers exactly once (thread-safe)."""
     global _instruments_started
     with _instruments_lock:
         if _instruments_started:
@@ -65,73 +100,82 @@ def _ensure_instruments_started() -> None:
                 args=(INSTRUMENT_PORT_BASE + i,),
                 daemon=True,
             ).start()
-        time.sleep(0.1)  # give listeners time to bind
+        time.sleep(0.15)  # give all listeners time to bind
         _instruments_started = True
+        logger.info(
+            "Mock instruments started: ports %d–%d",
+            INSTRUMENT_PORT_BASE,
+            INSTRUMENT_PORT_BASE + MAX_INSTRUMENTS - 1,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Parallel polling
 # ---------------------------------------------------------------------------
 
-def _poll_instrument(device_id: str, port: int, results: list) -> None:
-    start = time.time()
+def _poll_instrument(device_id: str, port: int) -> dict:
+    """Poll a single instrument and return a result dict (never raises)."""
+    start = time.perf_counter()
     try:
         with socket.create_connection(("localhost", port), timeout=2) as s:
             s.sendall(b":MEAS?\n")
-            data = s.recv(1024).decode().strip()
-            latency_ms = (time.time() - start) * 1000
-            results.append({"device_id": device_id, "data": data, "latency": latency_ms})
-    except Exception:
-        results.append({"device_id": device_id, "data": "ERROR", "latency": 0.0})
+            raw = s.recv(1024)
+            data = raw.decode(errors="replace").strip()
+            latency_ms = (time.perf_counter() - start) * 1000
+            return {"device": device_id, "pyLatency": f"{latency_ms:.3f}", "pyData": data}
+    except OSError as exc:
+        latency_ms = (time.perf_counter() - start) * 1000
+        logger.warning("Poll failed for %s on port %d: %s", device_id, port, exc)
+        return {"device": device_id, "pyLatency": f"{latency_ms:.3f}", "pyData": "ERROR"}
 
 
 # ---------------------------------------------------------------------------
-# HTTP endpoint
+# HTTP endpoints
 # ---------------------------------------------------------------------------
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
 
 @app.route("/benchmark", methods=["GET"])
 def benchmark():
-    _ensure_instruments_started()
+    ensure_instruments_started()
 
     try:
         count = int(request.args.get("count", 5))
-    except ValueError:
+    except (ValueError, TypeError):
         count = 5
     count = max(1, min(count, MAX_INSTRUMENTS))
 
-    cycle_start = time.time()
-    threads: list[threading.Thread] = []
-    results: list[dict] = []
+    # Pre-allocate result slots so ordering matches device numbering even with
+    # as_completed() yielding futures out of order.
+    ordered: list[dict | None] = [None] * count
+    cycle_start = time.perf_counter()
 
-    for i in range(count):
-        device_id = f"SMU-{i + 1}"
-        port = INSTRUMENT_PORT_BASE + i
-        t = threading.Thread(target=_poll_instrument, args=(device_id, port, results))
-        threads.append(t)
-        t.start()
+    with ThreadPoolExecutor(max_workers=count) as executor:
+        futures = {
+            executor.submit(_poll_instrument, f"SMU-{i + 1}", INSTRUMENT_PORT_BASE + i): i
+            for i in range(count)
+        }
+        for future in as_completed(futures):
+            ordered[futures[future]] = future.result()
 
-    for t in threads:
-        t.join()
-
-    cycle_ms = (time.time() - cycle_start) * 1000
+    cycle_ms = (time.perf_counter() - cycle_start) * 1000
 
     return jsonify({
         "cycleTimeMs": f"{cycle_ms:.3f}",
-        "measurements": [
-            {
-                "device": r["device_id"],
-                "pyLatency": f"{r['latency']:.3f}",
-                "pyData": r["data"],
-            }
-            for r in results
-        ],
+        "measurements": [r for r in ordered if r is not None],
     })
 
 
 if __name__ == "__main__":
-    _ensure_instruments_started()
-    print("--- ZENITH PYTHON PARALLEL ENGINE ---")
-    print(f"Mock Instruments : {MAX_INSTRUMENTS} active "
-          f"(ports {INSTRUMENT_PORT_BASE}–{INSTRUMENT_PORT_BASE + MAX_INSTRUMENTS - 1})")
-    print("HTTP Server      : http://localhost:8000/benchmark?count=N")
-    app.run(host="0.0.0.0", port=8000)
+    ensure_instruments_started()
+    logger.info("ZENITH PYTHON PARALLEL ENGINE")
+    logger.info(
+        "Mock Instruments: %d active (ports %d–%d)",
+        MAX_INSTRUMENTS, INSTRUMENT_PORT_BASE, INSTRUMENT_PORT_BASE + MAX_INSTRUMENTS - 1,
+    )
+    logger.info("HTTP Server: http://localhost:%d/benchmark?count=N", PORT)
+    logger.warning("Running Flask dev server — use Gunicorn for production.")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
