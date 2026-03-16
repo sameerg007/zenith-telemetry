@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -71,12 +70,23 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	count, err := strconv.Atoi(r.URL.Query().Get("count"))
-	if err != nil || count < 1 {
+	// If 'count' is omitted, use the default. If it is present but invalid,
+	// return 400 rather than silently defaulting — explicit errors are safer
+	// and easier to debug than silent coercions.
+	var count int
+	if raw := r.URL.Query().Get("count"); raw == "" {
 		count = 5
-	}
-	if count > maxInstruments {
-		count = maxInstruments
+	} else {
+		var err error
+		count, err = strconv.Atoi(raw)
+		if err != nil || count < 1 || count > maxInstruments {
+			w.Header().Set("Content-Type", "application/json")
+			http.Error(w,
+				fmt.Sprintf(`{"error":"'count' must be an integer between 1 and %d"}`, maxInstruments),
+				http.StatusBadRequest,
+			)
+			return
+		}
 	}
 
 	zEngine := &engine.ZenithEngine{}
@@ -116,7 +126,7 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 			results[i] = BenchmarkResponse{
 				Device:    res.DeviceID,
 				GoLatency: fmt.Sprintf("%.3f", float64(res.Latency.Microseconds())/1000.0),
-				GoData:    strings.TrimSpace(res.Data),
+				GoData:    res.Data, // Already trimmed and validated in dispatcher.
 			}
 		}(i)
 	}

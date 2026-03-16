@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -124,6 +125,12 @@ def ensure_instruments_started() -> None:
 # Parallel polling
 # ---------------------------------------------------------------------------
 
+# Compiled once at module load. Instrument responses must match this pattern
+# exactly; anything else is replaced with a safe sentinel so injected content
+# from a rogue instrument can never reach the API response.
+_MEAS_PATTERN = re.compile(r'^V:[0-9]+\.[0-9]+,I:[0-9]+\.[0-9]+$')
+
+
 def _poll_instrument(device_id: str, port: int) -> dict:
     """Poll a single instrument and return a result dict (never raises)."""
     start = time.perf_counter()
@@ -135,7 +142,16 @@ def _poll_instrument(device_id: str, port: int) -> dict:
             with s.makefile("r") as f:
                 data = f.readline().strip()
             latency_ms = (time.perf_counter() - start) * 1000
-            return {"device": device_id, "pyLatency": f"{latency_ms:.3f}", "pyData": data or "NO_DATA"}
+            # Validate format before returning. A response that does not match
+            # V:X.XXXX,I:X.XXXX is replaced with a safe sentinel value so
+            # injected content from a misbehaving instrument cannot propagate.
+            if not _MEAS_PATTERN.match(data):
+                logger.warning(
+                    "Unexpected instrument response from %s (port %d): %r — replaced with sentinel",
+                    device_id, port, data,
+                )
+                data = "INVALID_RESPONSE"
+            return {"device": device_id, "pyLatency": f"{latency_ms:.3f}", "pyData": data}
     except Exception as exc:
         latency_ms = (time.perf_counter() - start) * 1000
         logger.warning("Poll failed for %s on port %d: %s", device_id, port, exc)
@@ -165,11 +181,18 @@ def health():
 
 @app.route("/benchmark", methods=["GET"])
 def benchmark():
-    try:
-        count = int(request.args.get("count", 5))
-    except (ValueError, TypeError):
+    # If 'count' is omitted, use the default. If present but invalid,
+    # return 400 — explicit errors are safer than silent coercions.
+    raw_count = request.args.get("count", "")
+    if raw_count == "":
         count = 5
-    count = max(1, min(count, MAX_INSTRUMENTS))
+    else:
+        try:
+            count = int(raw_count)
+        except (ValueError, TypeError):
+            return jsonify({"error": "'count' must be a positive integer"}), 400
+        if count < 1 or count > MAX_INSTRUMENTS:
+            return jsonify({"error": f"'count' must be between 1 and {MAX_INSTRUMENTS}"}), 400
 
     # Pre-fill every slot with a safe error record so no response is ever None,
     # even if a future raises an unexpected exception.

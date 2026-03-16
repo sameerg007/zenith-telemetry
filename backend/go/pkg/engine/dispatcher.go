@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -17,6 +19,11 @@ const (
 	// maxResponseBytes prevents a misbehaving instrument from flooding the reader.
 	maxResponseBytes = 512
 )
+
+// measPattern is the only format an instrument response is allowed to have.
+// Strictly validating here ensures a rogue/misbehaving instrument cannot inject
+// arbitrary strings into the API response (prompt-injection / data-injection defence).
+var measPattern = regexp.MustCompile(`^V:[0-9]+\.[0-9]+,I:[0-9]+\.[0-9]+$`)
 
 type Measurement struct {
 	DeviceID string
@@ -57,5 +64,14 @@ func (e *ZenithEngine) Poll(ctx context.Context, id string, addr string) (Measur
 			fmt.Errorf("read: %w", err)
 	}
 
-	return Measurement{DeviceID: id, Data: resp, Latency: time.Since(start)}, nil
+	// Strip whitespace then validate against the expected measurement format.
+	// Any response that does not match is replaced with a safe sentinel value
+	// so it can never propagate injected content to the client.
+	trimmed := strings.TrimSpace(resp)
+	if !measPattern.MatchString(trimmed) {
+		return Measurement{DeviceID: id, Data: "INVALID_RESPONSE", Latency: time.Since(start)},
+			fmt.Errorf("unexpected instrument response format: %q", trimmed)
+	}
+
+	return Measurement{DeviceID: id, Data: trimmed, Latency: time.Since(start)}, nil
 }
