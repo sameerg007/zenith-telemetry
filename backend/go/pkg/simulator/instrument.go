@@ -7,7 +7,12 @@ import (
 	"math/rand"
 	"net"
 	"strings"
+	"time"
 )
+
+// connIdleTimeout is the maximum time a client can be silent before the
+// connection is closed, preventing goroutine leaks from stale connections.
+const connIdleTimeout = 30 * time.Second
 
 func StartMockInstrument(port string) {
 	// Generate stable readings once for this virtual instrument at startup.
@@ -35,8 +40,18 @@ func StartMockInstrument(port string) {
 
 func handleConnection(conn net.Conn, measResponse string) {
 	defer conn.Close()
+
+	// Refresh the deadline before each read so the idle timeout is per-command,
+	// not for the entire lifetime of the connection.
+	if err := conn.SetDeadline(time.Now().Add(connIdleTimeout)); err != nil {
+		return
+	}
+
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
+		// Reset the idle deadline after each successfully received command.
+		_ = conn.SetDeadline(time.Now().Add(connIdleTimeout))
+
 		switch strings.TrimSpace(scanner.Text()) {
 		case "*IDN?":
 			fmt.Fprintln(conn, "ZENITH-MOCK-B2901A-V2.6")
@@ -45,5 +60,10 @@ func handleConnection(conn net.Conn, measResponse string) {
 		default:
 			fmt.Fprintln(conn, "ERR:INVALID_SCPI_CMD")
 		}
+	}
+
+	// scanner.Err() is nil on clean EOF; any other error is a network/timeout problem.
+	if err := scanner.Err(); err != nil {
+		slog.Debug("instrument connection closed", "error", err)
 	}
 }

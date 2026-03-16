@@ -97,6 +97,10 @@ export default function BenchmarkPage() {
     const fetchData = async () => {
       setLoading(true);
       setError(null);
+      // Clear stale results immediately so the grid never shows data from a
+      // previous run while a new benchmark is in flight.
+      setRows([]);
+      setSummary('');
       try {
         const [goResp, pyResp] = await Promise.all([
           fetchGoBenchmarks(debouncedCount, signal),
@@ -161,10 +165,16 @@ export default function BenchmarkPage() {
       return;
     }
     if (val > maxInstruments) {
-      toast.error(`Max allowed instruments is ${maxInstruments}`);
+      // Use a stable toast id so rapid spinner clicks don't stack toasts.
+      toast.error(`Max allowed instruments is ${maxInstruments}`, { id: 'max-instruments' });
     }
     setInstrumentCount(val);
   }, [maxInstruments, minInstruments]);
+
+  // Clamp the displayed value to the valid range when the user leaves the field.
+  const handleCountBlur = useCallback(() => {
+    setInstrumentCount(c => Math.max(minInstruments, Math.min(maxInstruments, isNaN(c) ? minInstruments : c)));
+  }, [minInstruments, maxInstruments]);
 
   return (
     <div className="p-8">
@@ -182,8 +192,12 @@ export default function BenchmarkPage() {
           id="instrument-count"
           type="number"
           value={instrumentCount}
+          min={minInstruments}
+          max={maxInstruments}
+          step={1}
           onChange={handleCountChange}
-          className="border px-2 py-1 rounded w-20"
+          onBlur={handleCountBlur}
+          className="border px-2 py-1 rounded w-24"
           aria-label="Number of instruments to benchmark"
         />
         {goCycleTime && (

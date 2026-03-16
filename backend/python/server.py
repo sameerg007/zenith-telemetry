@@ -1,7 +1,8 @@
 """
 Zenith Python Parallel Engine
 Flask HTTP server that polls mock TCP instruments via a ThreadPoolExecutor.
-Mock instruments are started at server boot on ports 9101–9150.
+Mock instruments are started at server boot on ports 9001–9050 (shared with
+the Go engine — Python polls Go's stable listeners directly).
 
 Production usage:
     gunicorn --workers 1 --threads 64 --bind 0.0.0.0:8000 server:app
@@ -129,14 +130,28 @@ def _poll_instrument(device_id: str, port: int) -> dict:
     try:
         with socket.create_connection(("localhost", port), timeout=2) as s:
             s.sendall(b":MEAS?\n")
-            raw = s.recv(1024)
-            data = raw.decode(errors="replace").strip()
+            # makefile gives reliable line-oriented reading; recv(N) is not
+            # guaranteed to return a full line in a single call.
+            with s.makefile("r") as f:
+                data = f.readline().strip()
             latency_ms = (time.perf_counter() - start) * 1000
-            return {"device": device_id, "pyLatency": f"{latency_ms:.3f}", "pyData": data}
-    except OSError as exc:
+            return {"device": device_id, "pyLatency": f"{latency_ms:.3f}", "pyData": data or "NO_DATA"}
+    except Exception as exc:
         latency_ms = (time.perf_counter() - start) * 1000
         logger.warning("Poll failed for %s on port %d: %s", device_id, port, exc)
         return {"device": device_id, "pyLatency": f"{latency_ms:.3f}", "pyData": "ERROR"}
+
+
+# ---------------------------------------------------------------------------
+# Module-level thread pool — reused across all requests to avoid the overhead
+# of creating and destroying threads on every benchmark call.
+# ---------------------------------------------------------------------------
+_executor = ThreadPoolExecutor(max_workers=MAX_INSTRUMENTS, thread_name_prefix="zenith-poll")
+
+# Eagerly start instruments at module load time so they are ready before the first
+# HTTP request arrives. In WSGI mode (gunicorn), __name__ != "__main__", so the
+# if-block at the bottom would be skipped — this ensures startup always happens.
+ensure_instruments_started()
 
 
 # ---------------------------------------------------------------------------
@@ -150,32 +165,35 @@ def health():
 
 @app.route("/benchmark", methods=["GET"])
 def benchmark():
-    ensure_instruments_started()
-
     try:
         count = int(request.args.get("count", 5))
     except (ValueError, TypeError):
         count = 5
     count = max(1, min(count, MAX_INSTRUMENTS))
 
-    # Pre-allocate result slots so ordering matches device numbering even with
-    # as_completed() yielding futures out of order.
-    ordered: list[dict | None] = [None] * count
+    # Pre-fill every slot with a safe error record so no response is ever None,
+    # even if a future raises an unexpected exception.
+    ordered: list[dict] = [
+        {"device": f"SMU-{i + 1}", "pyLatency": "0.000", "pyData": "ERROR"}
+        for i in range(count)
+    ]
     cycle_start = time.perf_counter()
 
-    with ThreadPoolExecutor(max_workers=count) as executor:
-        futures = {
-            executor.submit(_poll_instrument, f"SMU-{i + 1}", INSTRUMENT_PORT_BASE + i): i
-            for i in range(count)
-        }
-        for future in as_completed(futures):
+    futures = {
+        _executor.submit(_poll_instrument, f"SMU-{i + 1}", INSTRUMENT_PORT_BASE + i): i
+        for i in range(count)
+    }
+    for future in as_completed(futures):
+        try:
             ordered[futures[future]] = future.result()
+        except Exception as exc:  # pragma: no cover — defensive catch
+            logger.error("Unexpected future error for index %d: %s", futures[future], exc)
 
     cycle_ms = (time.perf_counter() - cycle_start) * 1000
 
     return jsonify({
         "cycleTimeMs": f"{cycle_ms:.3f}",
-        "measurements": [r for r in ordered if r is not None],
+        "measurements": ordered,
     })
 
 

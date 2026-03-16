@@ -66,6 +66,11 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 }
 
 func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
 	count, err := strconv.Atoi(r.URL.Query().Get("count"))
 	if err != nil || count < 1 {
 		count = 5
@@ -74,9 +79,7 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 		count = maxInstruments
 	}
 
-	zEngine := &engine.ZenithEngine{
-		Results: make(chan engine.Measurement, count),
-	}
+	zEngine := &engine.ZenithEngine{}
 
 	// Honour both the global request timeout and any client-side cancellation.
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
@@ -91,13 +94,15 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 
 	for i := 0; i < count; i++ {
 		wg.Add(1)
-		semaphore <- struct{}{} // Acquire a slot
 
 		go func(i int) {
-			defer func() {
-				<-semaphore // Release the slot
-				wg.Done()
-			}()
+			defer wg.Done()
+
+			// Acquire a worker slot inside the goroutine so the loop never
+			// blocks the main goroutine — all goroutines are spawned immediately
+			// and queue themselves for execution.
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
 			id := fmt.Sprintf("SMU-%d", i+1)
 			addr := fmt.Sprintf("localhost:%d", instrumentPortBase+i)
@@ -120,6 +125,8 @@ func benchmarkHandler(w http.ResponseWriter, r *http.Request) {
 	cycleMs := float64(time.Since(cycleStart).Microseconds()) / 1000.0
 
 	w.Header().Set("Content-Type", "application/json")
+	// Prevent intermediary caches from serving stale benchmark data.
+	w.Header().Set("Cache-Control", "no-store")
 	if err := json.NewEncoder(w).Encode(BenchmarkResult{
 		CycleTimeMs:  fmt.Sprintf("%.3f", cycleMs),
 		Measurements: results,
