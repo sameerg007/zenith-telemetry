@@ -60,13 +60,13 @@ const COLUMN_DEFS: ColDef<Row>[] = [
   },
 ];
 
-function computeSummary(rows: Row[]): string {
-  if (rows.length === 0) return '';
-  const avgGo = rows.reduce((s, r) => s + (parseFloat(r.goLatency) || 0), 0) / rows.length;
-  const avgPy = rows.reduce((s, r) => s + (parseFloat(r.pyLatency) || 0), 0) / rows.length;
-  if (avgGo < avgPy) return `Go is faster (avg ${avgGo.toFixed(3)} ms vs ${avgPy.toFixed(3)} ms)`;
-  if (avgPy < avgGo) return `Python is faster (avg ${avgPy.toFixed(3)} ms vs ${avgGo.toFixed(3)} ms)`;
-  return `Both engines tied (avg ${avgGo.toFixed(3)} ms)`;
+function computeSummary(goCycleTime: string, pyCycleTime: string): string {
+  const goCycle = parseFloat(goCycleTime);
+  const pyCycle = parseFloat(pyCycleTime);
+  if (isNaN(goCycle) || isNaN(pyCycle)) return '';
+  if (goCycle < pyCycle) return `Go is faster (cycle ${goCycle.toFixed(3)} ms vs ${pyCycle.toFixed(3)} ms)`;
+  if (pyCycle < goCycle) return `Python is faster (cycle ${pyCycle.toFixed(3)} ms vs ${goCycle.toFixed(3)} ms)`;
+  return `Both engines tied (cycle ${goCycle.toFixed(3)} ms)`;
 }
 
 export default function BenchmarkPage() {
@@ -108,31 +108,37 @@ export default function BenchmarkPage() {
         const goMeasurements = goResp.measurements ?? [];
         const pyMeasurements = pyResp.measurements ?? [];
 
-        setGoCycleTime(goResp.cycleTimeMs ?? '');
-        setPyCycleTime(pyResp.cycleTimeMs ?? '');
+        const goCycle = goResp.cycleTimeMs ?? '';
+        const pyCycle = pyResp.cycleTimeMs ?? '';
+        setGoCycleTime(goCycle);
+        setPyCycleTime(pyCycle);
+
+        // Determine the overall winner from cycle time (total batch wall-clock).
+        // Per-row individual latencies are dominated by the same mock I/O delay
+        // and do not reflect the parallel engine's throughput advantage.
+        const goCycleMs = parseFloat(goCycle);
+        const pyCycleMs = parseFloat(pyCycle);
+        let overallWinner = 'N/A';
+        if (!isNaN(goCycleMs) && !isNaN(pyCycleMs)) {
+          if (goCycleMs < pyCycleMs) overallWinner = 'Go';
+          else if (pyCycleMs < goCycleMs) overallWinner = 'Python';
+          else overallWinner = 'Equal';
+        }
 
         const merged: Row[] = goMeasurements.map((g, i) => {
           const py = pyMeasurements[i] ?? { device: g.device, pyLatency: '', pyData: '' };
-          const goLat = parseFloat(g.goLatency);
-          const pyLat = parseFloat(py.pyLatency);
-          let winner = 'N/A';
-          if (!isNaN(goLat) && !isNaN(pyLat)) {
-            if (goLat < pyLat) winner = 'Go';
-            else if (pyLat < goLat) winner = 'Python';
-            else winner = 'Equal';
-          }
           return {
             device: g.device,
             goLatency: g.goLatency,
             pyLatency: py.pyLatency,
             goData: g.goData,
             pyData: py.pyData,
-            result: winner,
+            result: overallWinner,
           };
         });
 
         setRows(merged);
-        setSummary(computeSummary(merged));
+        setSummary(computeSummary(goCycle, pyCycle));
       } catch (err) {
         if ((err as Error).name === 'AbortError') return;
         console.error('Benchmark fetch failed:', err);

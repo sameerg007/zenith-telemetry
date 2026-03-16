@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration (environment-variable driven)
 # ---------------------------------------------------------------------------
-INSTRUMENT_PORT_BASE: int = 9101          # Python mock instruments: 9101–9150
+INSTRUMENT_PORT_BASE: int = 9001          # Shared mock instruments: 9001–9050 (same as Go engine)
 MAX_INSTRUMENTS: int = 50
 ALLOWED_ORIGIN: str = os.environ.get("ALLOWED_ORIGIN", "http://localhost:3000")
 PORT: int = int(os.environ.get("PORT", "8000"))
@@ -49,7 +49,8 @@ _instruments_started = False
 _instruments_lock = threading.Lock()
 
 
-def _handle_instrument_connection(conn: socket.socket) -> None:
+def _handle_instrument_connection(conn: socket.socket, meas_response: str) -> None:
+    """Serve one client connection, always returning the stable pre-generated reading."""
     with conn:
         while True:
             try:
@@ -62,20 +63,29 @@ def _handle_instrument_connection(conn: socket.socket) -> None:
             if command == "*IDN?":
                 conn.sendall(b"ZENITH-MOCK-B2901A-V2.6\n")
             elif command == ":MEAS?":
-                v = 0.8 + random.random() * (1.2 - 0.8)
-                i = 0.01 + random.random() * (0.05 - 0.01)
-                conn.sendall(f"V:{v:.4f},I:{i:.4f}\n".encode())
+                conn.sendall(f"{meas_response}\n".encode())
             else:
                 conn.sendall(b"ERR:INVALID_SCPI_CMD\n")
 
 
 def _run_mock_instrument(port: int) -> None:
+    # Generate stable readings once at startup so every :MEAS? poll on this
+    # port returns the same V/I.  Both Go and Python share the same ports
+    # (9001-9050), so when Go's instruments are already bound Python's bind
+    # will fail gracefully and Python polls Go's stable instruments instead.
+    v = 0.8 + random.random() * (2.1 - 0.2)
+    i = 0.01 + random.random() * (0.59 - 0.01)
+    meas_response = f"V:{v:.4f},I:{i:.4f}"
+
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(("localhost", port))
     except OSError as exc:
-        logger.error("Failed to bind mock instrument on port %d: %s", port, exc)
+        logger.warning(
+            "Port %d already bound (Go engine owns it) — Python will poll it directly. %s",
+            port, exc,
+        )
         return
     s.listen()
     while True:
@@ -84,7 +94,7 @@ def _run_mock_instrument(port: int) -> None:
         except OSError:
             break
         threading.Thread(
-            target=_handle_instrument_connection, args=(conn,), daemon=True
+            target=_handle_instrument_connection, args=(conn, meas_response), daemon=True
         ).start()
 
 
