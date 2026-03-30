@@ -35,14 +35,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 INSTRUMENT_PORT_BASE: int = 9001          # Shared mock instruments: 9001–9050 (same as Go engine)
 MAX_INSTRUMENTS: int = 50
-ALLOWED_ORIGIN: str = os.environ.get("ALLOWED_ORIGIN", "http://localhost:3000")
+ALLOWED_ORIGIN_PY: str = os.environ.get("ALLOWED_ORIGIN_PY", "http://localhost:3000")
 PORT: int = int(os.environ.get("PORT", "8000"))
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-CORS(app, origins=[ALLOWED_ORIGIN])
+CORS(app, origins=[ALLOWED_ORIGIN_PY])
 
 # ---------------------------------------------------------------------------
 # Mock TCP instrument
