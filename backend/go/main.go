@@ -36,22 +36,17 @@ type BenchmarkResult struct {
 	Measurements []BenchmarkResponse `json:"measurements"`
 }
 
-// allowedOrigin returns the CORS origin from the environment, defaulting to localhost.
-func allowedOrigin() string {
-	if o := os.Getenv("ALLOWED_ORIGIN"); o != "" {
-		return o
-	}
-	return "http://localhost:3000"
-}
-
-// corsMiddleware restricts cross-origin access to a configurable origin.
-func corsMiddleware(origin string, next http.Handler) http.Handler {
+// enableCORS applies CORS headers to every response.
+// Access-Control-Allow-Origin is set to "*" for broad compatibility during
+// development. Switch to the ALLOWED_ORIGIN environment variable before
+// deploying to production.
+func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -160,7 +155,6 @@ func main() {
 	}
 	time.Sleep(startupDelay)
 
-	origin := allowedOrigin()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/benchmark", benchmarkHandler)
@@ -168,7 +162,7 @@ func main() {
 	port := serverPort()
 	srv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      corsMiddleware(origin, mux),
+		Handler:      enableCORS(mux),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -178,7 +172,7 @@ func main() {
 		"instruments", maxInstruments,
 		"port_range", fmt.Sprintf("%d-%d", instrumentPortBase, instrumentPortBase+maxInstruments-1),
 		"listen", fmt.Sprintf("http://localhost:%s", port),
-		"allowed_origin", origin,
+		"allowed_origin", "*",
 	)
 
 	go func() {
